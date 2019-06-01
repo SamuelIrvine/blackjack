@@ -11,6 +11,14 @@
 using namespace std;
 namespace p = boost::python;
 
+const static double bjProfit = 6.0/5.0;
+const static bool doubleAfterSplit = false;
+const static bool surrender = true;
+const static bool countCards = true;
+const static bool hit17 = true;
+
+static unordered_map<size_t, double> profitMap;
+
 enum Card {
     ANY, ACE, TWO, THREE, FOUR, FIVE, SIX, SEVEN, EIGHT, NINE, TEN
 };
@@ -23,6 +31,7 @@ public:
 
     Shoe(const Shoe& shoe){
         nCard = shoe.nCard;
+        tCard = shoe.tCard;
     }
 
     Shoe(const size_t decks = 0){
@@ -30,10 +39,16 @@ public:
         nCard[1] = nCard[2] = nCard[3] = nCard[4] = nCard[5]
         = nCard[6] = nCard[7] = nCard[8] = nCard[9] = decks*4;
         nCard[10] = decks*16;
+        tCard = nCard;
     }
 
     double sample(const Card& card) const {
-        return (1.0*nCard[card])/(nCard[0]);
+        if (countCards){
+            return max(0.0, (1.0*nCard[card])/nCard[0]);
+        }
+        else {
+            return (1.0*tCard[card])/tCard[0];
+        }
     }
 
     void remove(const Card& card){
@@ -46,12 +61,21 @@ public:
         nCard[card]++;
     }
 
+    size_t hash(){
+        size_t hash = 0;
+        for (size_t i=0;i<11;i++){
+            hash |= ((tCard[i+1] - nCard[i+1])&0x1F)<<(i*5);
+        }
+        return hash;
+    }
+
 private:
     array<size_t, 11> nCard;
+    array<size_t, 11> tCard;
 };
 
 enum Move {
-    HIT, SPLIT, STAND, DOUBLE, RACE
+    SURRENDER, HIT, SPLIT, STAND, DOUBLE, RACE
 };
 
 class SubHand {
@@ -62,7 +86,7 @@ public:
         cards = subHand.cards;
         nCards = subHand.nCards;
         total = subHand.total;
-        soft = subHand.soft;
+        aces = subHand.aces;
     }
 
     SubHand(const Card& first = ANY, const Card& second = ANY){
@@ -75,9 +99,11 @@ public:
             cards[1] = second;
         }
         total = cards[0] + cards[1];
-        if (cards[0] == ACE || cards[1] == ACE){
-            soft = true;
-        }
+        aces = 0;
+        if (cards[0] == ACE)
+            aces++;
+        if (cards[1] == ACE)
+            aces++;
         wager = 1;
     }
 
@@ -91,7 +117,7 @@ public:
     }
 
     size_t getTotal() const{
-        if (soft && total<=11){
+        if (aces>0 && total<=11){
             return total+10;
         }else{
             return total;
@@ -101,10 +127,14 @@ public:
     void expose(const Card& card){
         cards[0] = card;
         total += card;
+        if (card == ACE)
+            aces++;
     }
 
     void backExpose(){
         total -= cards[0];
+        if (cards[0] == ACE)
+            aces--;
         cards[0] = ANY;
     }
 
@@ -112,10 +142,14 @@ public:
         cards[nCards] = card;
         nCards++;
         total+=card;
+        if (card == ACE)
+            aces++;
     }
 
     void backHit(){
         nCards--;
+        if (cards[nCards] == ACE)
+            aces--;
         total-=cards[nCards];
     }
 
@@ -140,7 +174,11 @@ public:
         cards[0] = first.cards[0];
         cards[1] = second.cards[0];
         total = cards[0]+cards[1];
-        soft = cards[0] == ACE;
+        aces = 0;
+        if (cards[0] == ACE)
+            aces++;
+        if (cards[1] == ACE)
+            aces++;
     }
 
     bool isFresh() const {
@@ -156,7 +194,7 @@ public:
     }
 
     bool isSoft() const {
-        return soft&&total<=11;
+        return aces>0&&total<=11;
     }
 
     bool isBust() const {
@@ -167,7 +205,7 @@ public:
         return nCards==2 && getTotal() == 21;
     }
 
-    int profit(const SubHand& dealer) const {
+    double profit(const SubHand& dealer) const {
         size_t playerTotal = getTotal();
         size_t dealerTotal = dealer.getTotal();
         bool playerBj = blackjack();
@@ -176,7 +214,7 @@ public:
             return 0;
         }
         if (playerBj){
-            return (wager*3)/2;
+            return wager*bjProfit;
         }
         if (dealerBj){
             return -wager;
@@ -210,7 +248,7 @@ private:
     array<Card, 20> cards;
     size_t total;
     int wager;
-    bool soft = false;
+    int aces = 0;
 };
 
 enum HandState {
@@ -404,6 +442,8 @@ std::ostream& operator<<(std::ostream& os, const Move& move) {
             return os<<"Double";
         case RACE:
             return os<<"Race";
+        case SURRENDER:
+            return os<<"Surrender";
         default:
             return os<<"Unknown move";
     }
@@ -461,7 +501,7 @@ public:
         size_t v0 = player.getWager();
         size_t v1 = nextCard;//0-10
         size_t v2 = dealer.getTotal();//1-11
-        size_t v3 = 0;
+        size_t v3;
         if (player.isBust()){
             v3 = 22;
         } else if (player.blackjack()){
@@ -470,10 +510,12 @@ public:
             v3 = player.getTotal();
         }
         size_t idx = v0 + v1*2 + v2*2*11 + v3*2*11*12;
-        if (profitLookup[idx]==DBL_MAX){
-            profitLookup[idx] = pushDealer(player, nextCard);
+        size_t hash = countCards?shoe.hash():0;
+        hash |= (idx<<50);
+        if (!profitMap[hash]){
+            profitMap[hash] = pushDealer(player, nextCard);
         }
-        return profitLookup[idx];
+        return profitMap[hash];
     }
 
     double pushDealer(const SubHand& player, const Card& nextCard=ANY){
@@ -491,20 +533,18 @@ public:
                 shoe.add(card1);
             }
         } else if (nextCard!=ANY){
-            shoe.remove(nextCard);
-            if (dealer.getTotal()<17 || (dealer.isSoft()&&dealer.getTotal()==17)) {
+            if (dealer.getTotal()<17 || (hit17&&dealer.isSoft()&&dealer.getTotal()==17)) {
                 dealer.hit(nextCard);
                 ev += pushDealer(player);
                 dealer.backHit();
             } else {
                 ev += player.profit(dealer);
             }
-            shoe.add(nextCard);
         } else {
             for (Card card1: allCards) {
                 double p1 = shoe.sample(card1);
                 shoe.remove(card1);
-                if (dealer.getTotal() < 17 || (dealer.isSoft() && dealer.getTotal() == 17)) {
+                if (dealer.getTotal() < 17 || (hit17&&dealer.isSoft() && dealer.getTotal() == 17)) {
                     dealer.hit(card1);
                     ev += p1 * pushDealer(player);
                     dealer.backHit();
@@ -524,31 +564,37 @@ public:
         if (player.getTotal()>=21){
             return Result(standEV, nextCard);
         }
-        double p0 = 1.0;
         size_t nCards = nextCard==ANY?allCards.size():1;
         const Card* cards = nextCard==ANY?&allCards[0]:&nextCard;
-        for (size_t i=0;i<nCards;i++){
-            const Card card1 = cards[i];
-            double p1 = nCards==1?1.0:shoe.sample(card1);
-            //shoe.remove(card1);
-            if (player.isFresh()){
+        if (player.isFresh()){
+            for (size_t i=0;i<nCards;i++){
+                const Card card1 = cards[i];
+                double p1 = nCards==1?1.0:shoe.sample(card1);
+                shoe.remove(card1);
                 player.doubleDown(card1);
                 doubleEV += p1*profit(player, ANY);
                 player.backDoubleDown();
+                shoe.add(card1);
             }
+        }
+        double p0 = 1.0;
+        for (size_t i=0;i<nCards;i++){
+            const Card card1 = cards[i];
+            double p1 = nCards==1?1.0:shoe.sample(card1);
+            shoe.remove(card1);
             player.hit(card1);
             if (player.isBust()){
                 hitEV += p0*profit(player, ANY);
                 player.backHit();
-                //shoe.add(card1);
+                shoe.add(card1);
                 break;
             }
             hitEV += p1*pushSubHand(player, ANY, isFinal).ev;
             player.backHit();
-            //shoe.add(card1);
+            shoe.add(card1);
             p0 -= p1;
         }
-        if (doubleEV>standEV && doubleEV>hitEV && player.isFresh()){
+	if (doubleAfterSplit && doubleEV>standEV && doubleEV>hitEV && player.isFresh()){
             return Result(doubleEV, ANY);
         } else if (standEV>hitEV){
             return Result(standEV, nextCard);
@@ -562,33 +608,33 @@ public:
         double doubleEV = 0.0;
         double standEV = 0.0;
         double splitEV = 0.0;
+        double surrenderEV = surrender?-0.5:-1E10;
         HandState state = hand.getState();
         if (state == COMPLETE){
-            return Result(-1E100, nextCard, Move::STAND);
+            return Result(bjProfit, nextCard, Move::STAND);
         } else {
             size_t nCards = nextCard==ANY?allCards.size():1;
             const Card* cards = nextCard==ANY?&allCards[0]:&nextCard;
             for (size_t i=0;i<nCards;i++) {
                 const Card card1 = cards[i];
                 double p1 = nCards==1?1.0:shoe.sample(card1);
-                //shoe.remove(card1);
+                shoe.remove(card1);
                 if (state == DOUBLES){
                     for (const Card card2: allCards){
                         double p2 = shoe.sample(card2);
-                        //shoe.remove(card2);
+                        shoe.remove(card2);
                         hand.split(card1, card2);
                         splitEV+=p1*p2*pushSubHand(hand.getSubHand(0), ANY, false).ev;
                         splitEV+=p1*p2*pushSubHand(hand.getSubHand(1), ANY, false).ev;
                         hand.backSplit();
-
-                        //shoe.add(card2);
+                        shoe.add(card2);
                     }
                 }
 
 
                 if (state == DOUBLES || state == FRESH) {
                     hand.doubleDown(card1);
-                    doubleEV+=p1*pushSubHand(hand.getSubHand(0), ANY, false).ev;
+                    doubleEV+=p1*profit(hand.getSubHand(0), nextCard);
                     hand.backDoubleDown();
                 }
                 if (state == OPEN || state == DOUBLES || state == FRESH){
@@ -596,7 +642,7 @@ public:
                     hitEV+=p1*pushSubHand(hand.getSubHand(0), ANY, false).ev;
                     hand.backHit();
                 }
-                //shoe.add(card1);
+                shoe.add(card1);
             }
             if (state == OPEN || state == DOUBLES || state == FRESH){
                 hand.stand();
@@ -605,14 +651,16 @@ public:
             }
 
             cout<<"standEv: "<<standEV<<", hitEV: "<<hitEV<<", doubleEV: "<<doubleEV<<", splitEV: "<<splitEV<<endl;
-            if (state == DOUBLES && splitEV>doubleEV && splitEV>hitEV&&splitEV>standEV){
+            if (state == DOUBLES && splitEV>doubleEV && splitEV>hitEV&&splitEV>standEV && splitEV>surrenderEV){
                 return Result(splitEV, nextCard, SPLIT);
-            } else if ((state == DOUBLES || state == FRESH) && doubleEV>hitEV && doubleEV>standEV){
+            } else if ((state == DOUBLES || state == FRESH) && doubleEV>hitEV && doubleEV>standEV && doubleEV>surrenderEV){
                 return Result(doubleEV, nextCard, DOUBLE);
-            } else if ((state == OPEN || state == DOUBLES || state == FRESH) && hitEV>standEV){
+            } else if ((state == OPEN || state == DOUBLES || state == FRESH) && hitEV>standEV && hitEV>surrenderEV){
                 return Result(hitEV, nextCard, HIT);
-            } else{
+            } else if (standEV>surrenderEV){
                 return Result(standEV, nextCard, STAND);
+            } else {
+                return Result(surrenderEV, nextCard, SURRENDER);
             }
         }
     }
@@ -623,9 +671,6 @@ private:
     Shoe shoe;
     SubHand dealer;
     Hand hand;
-
-    vector<double> profitLookup = vector<double>(24*12*11*2, DBL_MAX);
-
 };
 
 /*int main(){
@@ -655,7 +700,8 @@ BOOST_PYTHON_MODULE(libBlackjack){
                 .value("DOUBLE", Move::DOUBLE)
                 .value("HIT", Move::HIT)
                 .value("RACE", Move::RACE)
-                .value("SPLIT", Move::SPLIT);
+                .value("SPLIT", Move::SPLIT)
+                .value("SURRENDER", Move::SURRENDER);
         p::class_<Shoe>("Shoe", p::init<const size_t>())
                 .def("sample", &Shoe::sample)
                 .def("remove", &Shoe::remove)
